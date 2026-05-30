@@ -1,0 +1,65 @@
+import "./lib/error-capture";
+
+import { consumeLastCapturedError } from "./lib/error-capture";
+import { renderErrorPage } from "./lib/error-page";
+
+type ServerEntry = {
+  fetch: (request: Request, env: unknown, ctx: unknown) => Promise<Response> | Response;
+};
+
+let serverEntryPromise: Promise<ServerEntry> | undefined;
+
+async function getServerEntry(): Promise<ServerEntry> {
+  if (!serverEntryPromise) {
+    serverEntryPromise = import("@tanstack/react-start/server-entry").then(
+      (m) => (m.default ?? m) as ServerEntry,
+    );
+  }
+  return serverEntryPromise;
+}
+
+// h3 swallows in-handler throws into a normal 500 Response with body
+// {"unhandled":true,"message":"HTTPError"} — try/catch alone never fires for those.
+async function normalizeCatastrophicSsrResponse(response: Response): Promise<Response> {
+  if (response.status < 500) return response;
+  const contentType = response.headers.get("content-type") ?? "";
+  if (!contentType.includes("application/json")) return response;
+
+  const body = await response.clone().text();
+  if (!body.includes('"unhandled":true') || !body.includes('"message":"HTTPError"')) {
+    return response;
+  }
+
+  const capturedError = consumeLastCapturedError();
+  if (capturedError) {
+    console.error("Original SSR error captured:", capturedError);
+    if (capturedError instanceof Error) {
+      console.error("Error stack:", capturedError.stack);
+    }
+  } else {
+    console.error(`h3 swallowed SSR error with no captured error. Response body: ${body}`);
+  }
+  return new Response(renderErrorPage(), {
+    status: 500,
+    headers: { "content-type": "text/html; charset=utf-8" },
+  });
+}
+
+export default {
+  async fetch(request: Request, env: unknown, ctx: unknown) {
+    try {
+      const handler = await getServerEntry();
+      const response = await handler.fetch(request, env, ctx);
+      return await normalizeCatastrophicSsrResponse(response);
+    } catch (error) {
+      console.error("Caught SSR error in fetch handler:", error);
+      if (error instanceof Error) {
+        console.error("Error stack:", error.stack);
+      }
+      return new Response(renderErrorPage(), {
+        status: 500,
+        headers: { "content-type": "text/html; charset=utf-8" },
+      });
+    }
+  },
+};
